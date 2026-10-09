@@ -275,13 +275,13 @@ function downloadForecastCsv(rows, meetingName, sessionName) {
   URL.revokeObjectURL(url);
 }
 
-function TrackMap({ points, color, circuitName, circuitImage }) {
+function TrackMap({ points, color, circuitName, circuitImage, progressIndex = null }) {
   const [imageFailed, setImageFailed] = useState(false);
-  const normalized = useMemo(() => {
+  const normalizedPoints = useMemo(() => {
     const valid = points
       .map((point) => ({ x: safeNumber(point.x), y: safeNumber(point.y) }))
       .filter((point) => point.x !== null && point.y !== null);
-    if (valid.length < 2) return "";
+    if (valid.length < 2) return [];
     const xs = valid.map((point) => point.x);
     const ys = valid.map((point) => point.y);
     const minX = Math.min(...xs);
@@ -290,11 +290,21 @@ function TrackMap({ points, color, circuitName, circuitImage }) {
     const maxY = Math.max(...ys);
     const spanX = maxX - minX || 1;
     const spanY = maxY - minY || 1;
-    return valid
-      .filter((_, index) => index % Math.max(1, Math.floor(valid.length / 500)) === 0)
-      .map((point) => `${12 + ((point.x - minX) / spanX) * 276},${188 - ((point.y - minY) / spanY) * 166}`)
-      .join(" ");
+    return valid.map((point) => ({
+      x: 12 + ((point.x - minX) / spanX) * 276,
+      y: 188 - ((point.y - minY) / spanY) * 166,
+    }));
   }, [points]);
+  const visiblePoints = normalizedPoints.filter((_, index) => index % Math.max(1, Math.floor(normalizedPoints.length / 500)) === 0);
+  const normalized = visiblePoints.map((point) => `${point.x},${point.y}`).join(" ");
+  const activePoint = Number.isInteger(progressIndex) && normalizedPoints.length
+    ? normalizedPoints[Math.min(progressIndex, normalizedPoints.length - 1)]
+    : null;
+  const completedTrace = activePoint
+    ? normalizedPoints.slice(0, Math.min(progressIndex + 1, normalizedPoints.length))
+      .filter((_, index) => index % Math.max(1, Math.floor(normalizedPoints.length / 500)) === 0)
+      .map((point) => `${point.x},${point.y}`).join(" ")
+    : "";
 
   const layout = getCircuitLayout(circuitName);
   const layoutStart = layout?.path.match(/M\s*([\d.]+)[ ,]+([\d.]+)/);
@@ -302,11 +312,18 @@ function TrackMap({ points, color, circuitName, circuitImage }) {
 
   return (
     <div className="track-map">
-      {normalized ? (
+      {normalizedPoints.length > 1 ? (
         <svg viewBox="0 0 300 200" role="img" aria-label="Driver track position trace">
           <polyline className="track-shadow" points={normalized} />
-          <polyline points={normalized} style={{ stroke: color }} />
-          <circle className="track-start" cx={normalized.split(" ")[0]?.split(",")[0]} cy={normalized.split(" ")[0]?.split(",")[1]} r="4" />
+          {activePoint && <polyline className="track-future" points={normalized} />}
+          <polyline points={activePoint ? completedTrace : normalized} style={{ stroke: color }} />
+          <circle className="track-start" cx={normalizedPoints[0].x} cy={normalizedPoints[0].y} r="3" />
+          {activePoint && (
+            <>
+              <circle className="track-driver-halo" cx={activePoint.x} cy={activePoint.y} r="8" style={{ fill: color }} />
+              <circle className="track-driver-dot" cx={activePoint.x} cy={activePoint.y} r="4" style={{ fill: color }} />
+            </>
+          )}
         </svg>
       ) : layout && (!circuitImage || imageFailed) ? (
         <svg className="circuit-layout" viewBox="0 0 300 200" role="img" aria-label={`${layout.name} circuit schematic`}>
@@ -328,7 +345,7 @@ function TrackMap({ points, color, circuitName, circuitImage }) {
       )}
       <span className="map-caption">
         <i style={{ background: color }} />
-        {normalized
+        {normalizedPoints.length > 1
           ? "DRIVER GPS TRACE"
           : circuitImage && !imageFailed
             ? `${circuitName.toUpperCase()} · OFFICIAL MAP`
@@ -336,6 +353,101 @@ function TrackMap({ points, color, circuitName, circuitImage }) {
               ? `${layout.name.toUpperCase()} · SCHEMATIC`
               : "CIRCUIT DATA"}
       </span>
+    </div>
+  );
+}
+
+function DriverReplay({ points, color, circuitName, circuitImage }) {
+  const [pointIndex, setPointIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const orderedPoints = useMemo(
+    () => points
+      .filter((point) => safeNumber(point.x) !== null && safeNumber(point.y) !== null)
+      .sort((left, right) => new Date(left.date || 0) - new Date(right.date || 0)),
+    [points],
+  );
+  const lastIndex = orderedPoints.length - 1;
+  const currentPoint = orderedPoints[Math.min(pointIndex, lastIndex)];
+  const elapsedValue = currentPoint && orderedPoints[0]
+    ? (new Date(currentPoint.date).getTime() - new Date(orderedPoints[0].date).getTime()) / 1000
+    : 0;
+  const elapsed = Number.isFinite(elapsedValue) ? Math.max(0, elapsedValue) : 0;
+
+  useEffect(() => {
+    setPointIndex(0);
+    setPlaying(false);
+  }, [orderedPoints]);
+
+  useEffect(() => {
+    if (!playing || lastIndex < 1) return undefined;
+    const timer = window.setInterval(() => {
+      setPointIndex((current) => Math.min(current + 1, lastIndex));
+    }, 250 / speed);
+    return () => window.clearInterval(timer);
+  }, [playing, lastIndex, speed]);
+
+  useEffect(() => {
+    if (pointIndex >= lastIndex) setPlaying(false);
+  }, [pointIndex, lastIndex]);
+
+  return (
+    <div className="driver-replay">
+      <TrackMap
+        points={orderedPoints}
+        color={color}
+        circuitName={circuitName}
+        circuitImage={circuitImage}
+        progressIndex={orderedPoints.length > 1 ? pointIndex : null}
+      />
+      {orderedPoints.length > 1 ? (
+        <div className="replay-controls">
+          <div className="replay-actions">
+            <button
+              type="button"
+              className="replay-button"
+              onClick={() => {
+                if (playing) {
+                  setPlaying(false);
+                } else {
+                  if (pointIndex >= lastIndex) setPointIndex(0);
+                  setPlaying(true);
+                }
+              }}
+              aria-label={playing ? "Pause driver replay" : "Play driver replay"}
+            >
+              {playing ? "Ⅱ PAUSE" : pointIndex >= lastIndex ? "↻ REPLAY" : "▶ PLAY"}
+            </button>
+            <button
+              type="button"
+              className="replay-speed"
+              onClick={() => setSpeed((current) => current === 1 ? 2 : 1)}
+              aria-label={`Playback speed ${speed}x; click to change`}
+            >
+              {speed}×
+            </button>
+            <span className="replay-time">+{elapsed.toFixed(1)} SEC</span>
+            <span className="replay-samples">{orderedPoints.length} GPS SAMPLES</span>
+          </div>
+          <input
+            className="replay-scrubber"
+            type="range"
+            min="0"
+            max={lastIndex}
+            value={Math.min(pointIndex, lastIndex)}
+            aria-label="Scrub through the driver's lap"
+            onChange={(event) => {
+              setPlaying(false);
+              setPointIndex(Number(event.target.value));
+            }}
+          />
+          <div className="replay-axis"><span>START</span><span>LAP TIMELINE</span><span>FINISH</span></div>
+        </div>
+      ) : (
+        <div className="empty-state replay-empty">
+          GPS position samples are not available for this lap. The circuit layout is shown for reference.
+        </div>
+      )}
     </div>
   );
 }
@@ -646,9 +758,9 @@ export default function App() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="#" aria-label="APEX home">
-          <span className="brand-mark">A</span>
-          <span>APEX<span className="brand-sub">RACE INTELLIGENCE</span></span>
+        <a className="brand" href="#" aria-label="F1 Race Intelligence home">
+          <img className="brand-mark" src="/f1-logo.png" alt="" />
+          <span className="brand-sub">RACE INTELLIGENCE</span>
         </a>
         <div className="sidebar-rule" />
         <div className="side-label">RACE CONTROL</div>
@@ -701,7 +813,7 @@ export default function App() {
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumbs">APEX <span>/</span> {year} SEASON <span>/</span> {selectedMeeting?.country_name || "RACE CONTROL"}</div>
+          <div className="breadcrumbs">F1 <span>/</span> {year} SEASON <span>/</span> {selectedMeeting?.country_name || "RACE CONTROL"}</div>
           <div className="topbar-actions">
             <span className="sync-time">{lastUpdated ? `SYNC ${lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "AWAITING DATA"}</span>
             <button className="icon-button" onClick={refresh} aria-label="Refresh race data" title="Refresh data">↻</button>
@@ -1017,7 +1129,7 @@ export default function App() {
                     <SectionHeading eyebrow="ONBOARD DATA" title="Fastest lap telemetry" detail={`${selectedDriver ? driverName(selectedDriver) : "Driver"} · lap ${fastestLap?.lap_number || "—"} · speed, throttle, brake & RPM`} />
                     {loading.telemetry ? <div className="panel-loading">Pulling car data…</div> : telemetry.length ? (
                       <TelemetryChart rows={telemetry} />
-                    ) : <div className="empty-state tall">High-frequency car data is unavailable for this lap or session.</div>}
+                    ) : <div className="empty-state tall">High-frequency speed, throttle and RPM data was not recorded for this lap. Check the GPS replay below for the driver's movement around the circuit.</div>}
                   </section>
                   <section className="panel">
                     <SectionHeading eyebrow="LAP PACE" title="Lap time progression" detail="Every completed lap in this session" />
@@ -1030,8 +1142,8 @@ export default function App() {
                     </div>
                   </section>
                   <section className="panel map-wide">
-                    <SectionHeading eyebrow="GPS POSITION" title="Circuit layout" detail={location.length ? `GPS trace · ${selectedDriver ? driverName(selectedDriver) : "selected driver"}` : "Illustrative circuit schematic · not to scale"} />
-                    <TrackMap points={location} color={teamColor(selectedDriver)} circuitName={selectedMeeting?.circuit_short_name || selectedMeeting?.meeting_name || ""} circuitImage={selectedMeeting?.circuit_image} />
+                    <SectionHeading eyebrow="GPS POSITION REPLAY" title="Driver movement" detail={`${selectedDriver ? driverName(selectedDriver) : "Selected driver"} · lap ${fastestLap?.lap_number || "—"} · play or scrub through recorded track positions`} />
+                    <DriverReplay points={location} color={teamColor(selectedDriver)} circuitName={selectedMeeting?.circuit_short_name || selectedMeeting?.meeting_name || ""} circuitImage={selectedMeeting?.circuit_image} />
                   </section>
                 </div>
               )}
