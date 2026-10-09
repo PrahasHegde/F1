@@ -1,5 +1,8 @@
 # APEX — F1 Race Intelligence
 
+<img width="1877" height="1038" alt="image" src="https://github.com/user-attachments/assets/9f14e569-71be-488d-a56c-a4add4b60ec0" />
+
+
 A Formula 1-themed race analytics dashboard built with React and Vite. It combines race timing, driver and circuit views, telemetry, strategy analysis, and an explainable short-term pace forecast.
 
 ## Features
