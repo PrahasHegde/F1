@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { clearApiCache, fetchOpenF1 } from "./api.js";
+import { predictDriverPace, predictSessionPace } from "./analysis.js";
 
 const CURRENT_YEAR = new Date().getFullYear();
 const YEARS = Array.from({ length: 4 }, (_, index) => CURRENT_YEAR - index);
@@ -54,12 +55,53 @@ function driverName(driver) {
 
 function isValidLap(lap) {
   const duration = safeNumber(lap?.lap_duration);
-  return duration !== null && duration > 0;
+  return duration !== null && duration > 0 && !lap?.is_pit_out_lap;
 }
 
 function teamColor(driver) {
   const color = String(driver?.team_colour || "e10600").replace("#", "");
   return `#${color}`;
+}
+
+const SECTOR_KEYS = [
+  { key: "duration_sector_1", label: "Sector 1" },
+  { key: "duration_sector_2", label: "Sector 2" },
+  { key: "duration_sector_3", label: "Sector 3" },
+];
+
+function summarizeLaps(rows) {
+  const valid = rows.filter(isValidLap);
+  if (!valid.length) return { count: 0, best: null, average: null, median: null, consistency: null, topSpeed: null, sectors: [] };
+  const times = valid.map((lap) => Number(lap.lap_duration)).sort((a, b) => a - b);
+  const average = times.reduce((total, time) => total + time, 0) / times.length;
+  const median = times.length % 2
+    ? times[Math.floor(times.length / 2)]
+    : (times[times.length / 2 - 1] + times[times.length / 2]) / 2;
+  return {
+    count: valid.length,
+    best: valid.reduce((best, lap) => Number(lap.lap_duration) < Number(best.lap_duration) ? lap : best),
+    average,
+    median,
+    consistency: medianOf(times.map((time) => Math.abs(time - median))),
+    topSpeed: Math.max(...valid.map((lap) => safeNumber(lap.st_speed) || 0)) || null,
+    sectors: SECTOR_KEYS.map(({ key, label }) => ({
+      key,
+      label,
+      best: valid.map((lap) => safeNumber(lap[key])).filter((time) => time !== null && time > 0).sort((a, b) => a - b)[0] || null,
+    })),
+  };
+}
+
+function medianOf(values) {
+  const sorted = values.filter((value) => value !== null && Number.isFinite(value)).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function formatDelta(value, suffix = "s") {
+  if (value === null || !Number.isFinite(value)) return "—";
+  return `${value > 0 ? "+" : ""}${value.toFixed(3)}${suffix}`;
 }
 
 function SectionHeading({ eyebrow, title, detail, action }) {
@@ -83,6 +125,154 @@ function Metric({ label, value, note, accent = false }) {
       {note && <span className="metric-note">{note}</span>}
     </div>
   );
+}
+
+function DriverPortrait({ driver, className = "" }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [driver?.headshot_url]);
+  return (
+    <div className={`portrait-frame ${className}`} style={{ "--team-color": teamColor(driver) }}>
+      {driver?.headshot_url && !imageFailed ? (
+        <img src={driver.headshot_url} alt={driverName(driver)} onError={() => setImageFailed(true)} />
+      ) : (
+        <span className="portrait-fallback">{String(driver?.name_acronym || driverName(driver)).slice(0, 3)}</span>
+      )}
+    </div>
+  );
+}
+
+function PaceChart({ primary, comparison, primaryColor, comparisonColor }) {
+  const primaryLaps = primary.filter(isValidLap).sort((a, b) => Number(a.lap_number) - Number(b.lap_number));
+  const comparisonLaps = comparison.filter(isValidLap).sort((a, b) => Number(a.lap_number) - Number(b.lap_number));
+  const values = [...primaryLaps, ...comparisonLaps].map((lap) => Number(lap.lap_duration));
+  if (!values.length) return <div className="empty-state">No comparable lap times were recorded for this session.</div>;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const pointString = (rows) => rows.map((lap, index) => {
+    const x = 42 + (index / Math.max(rows.length - 1, 1)) * 700;
+    const y = 18 + ((Number(lap.lap_duration) - min) / span) * 120;
+    return `${x},${y}`;
+  }).join(" ");
+  return (
+    <div className="pace-chart-wrap">
+      <div className="pace-chart-legend">
+        <span><i style={{ background: primaryColor }} />PRIMARY · {primaryLaps.length} LAPS</span>
+        {comparisonLaps.length > 0 && <span><i style={{ background: comparisonColor }} />COMPARISON · {comparisonLaps.length} LAPS</span>}
+        <span className="pace-chart-note">LOWER IS FASTER</span>
+      </div>
+      <svg className="pace-chart" viewBox="0 0 780 158" role="img" aria-label="Lap time comparison across the session">
+        {[0, 1, 2, 3].map((line) => {
+          const y = 20 + line * 40;
+          const time = max - (span * line) / 3;
+          return <g key={line}><line x1="42" x2="750" y1={y} y2={y} /><text x="0" y={y + 3}>{time.toFixed(1)}s</text></g>;
+        })}
+        <polyline className="pace-line" points={pointString(primaryLaps)} style={{ stroke: primaryColor }} />
+        {comparisonLaps.length > 0 && <polyline className="pace-line" points={pointString(comparisonLaps)} style={{ stroke: comparisonColor }} />}
+        {primaryLaps.map((lap, index) => (
+          <circle key={`p-${lap.lap_number}`} cx={42 + (index / Math.max(primaryLaps.length - 1, 1)) * 700} cy={18 + ((Number(lap.lap_duration) - min) / span) * 120} r="2.5" style={{ fill: primaryColor }}>
+            <title>Lap {lap.lap_number}: {formatLap(lap.lap_duration)}</title>
+          </circle>
+        ))}
+      </svg>
+      <div className="pace-chart-axis"><span>EARLIER LAPS</span><span>LAP SEQUENCE →</span><span>LATER LAPS</span></div>
+    </div>
+  );
+}
+
+function SectorBars({ sectors, primaryColor, comparisonColor }) {
+  const available = sectors.filter((sector) => sector.primary !== null || sector.comparison !== null || sector.field !== null);
+  if (!available.length) return <div className="empty-state">Sector timing is not available in this session.</div>;
+  return (
+    <div className="sector-list">
+      {available.map((sector) => {
+        const values = [sector.primary, sector.comparison, sector.field].filter((value) => value !== null);
+        const reference = Math.max(...values);
+        return (
+          <div className="sector-item" key={sector.label}>
+            <div className="sector-title"><strong>{sector.label}</strong><span>FIELD BEST {sector.field ? `${sector.field.toFixed(3)}s` : "—"}</span></div>
+            <div className="sector-row">
+              <span>YOU</span><div className="sector-track"><i style={{ width: `${sector.primary ? (sector.primary / reference) * 100 : 0}%`, background: primaryColor }} /></div>
+              <strong>{sector.primary ? `${sector.primary.toFixed(3)}s` : "—"}</strong>
+            </div>
+            {sector.comparison !== null && (
+              <div className="sector-row">
+                <span>RIVAL</span><div className="sector-track"><i style={{ width: `${(sector.comparison / reference) * 100}%`, background: comparisonColor }} /></div>
+                <strong>{sector.comparison.toFixed(3)}s</strong>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ForecastChart({ forecasts, colors }) {
+  const active = forecasts.filter((item) => item.forecast.length);
+  if (!active.length) return <div className="empty-state">Collect at least five valid laps in a stint to build a pace forecast.</div>;
+  const values = active.flatMap((item) => item.forecast.flatMap((point) => [point.lower, point.upper]));
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const range = maximum - minimum || 1;
+  const y = (value) => 18 + ((maximum - value) / range) * 116;
+  const x = (index) => 65 + index * 215;
+  return (
+    <div className="forecast-chart-wrap">
+      <svg className="forecast-chart" viewBox="0 0 760 160" role="img" aria-label="Three-lap pace projection with uncertainty band">
+        {[0, 1, 2].map((line) => {
+          const value = maximum - (range * line) / 2;
+          return <g key={line}><line x1="55" x2="745" y1={y(value)} y2={y(value)} /><text x="0" y={y(value) + 3}>{formatLap(value)}</text></g>;
+        })}
+        {[0, 1, 2].map((index) => <text className="forecast-x-label" key={index} x={x(index)} y="154" textAnchor="middle">LAP {active[0].forecast[index]?.lapNumber ?? "—"}</text>)}
+        {active.map((item, itemIndex) => {
+          const color = colors[itemIndex];
+          const upper = item.forecast.map((point, index) => `${x(index)},${y(point.upper)}`);
+          const lower = [...item.forecast].reverse().map((point, index) => `${x(item.forecast.length - index - 1)},${y(point.lower)}`);
+          const medianPoints = item.forecast.map((point, index) => `${x(index)},${y(point.lapTime)}`).join(" ");
+          return (
+            <g key={item.driver.driver_number}>
+              <polygon points={[...upper, ...lower].join(" ")} style={{ fill: color, opacity: .11 }} />
+              <polyline className="forecast-line" points={medianPoints} style={{ stroke: color }} />
+              {item.forecast.map((point, index) => (
+                <circle key={point.lapNumber} cx={x(index)} cy={y(point.lapTime)} r="4" style={{ fill: color }}>
+                  <title>{item.driver.name_acronym} projected lap {point.lapNumber}: {formatLap(point.lapTime)} ± {item.uncertainty?.toFixed(2)}s</title>
+                </circle>
+              ))}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function downloadForecastCsv(rows, meetingName, sessionName) {
+  const fields = [
+    ["driver", (row) => row.driver.full_name || driverName(row.driver)],
+    ["team", (row) => row.driver.team_name || ""],
+    ["confidence", (row) => row.status],
+    ["clean_laps_used", (row) => row.sampleSize],
+    ["last_lap", (row) => row.lastLap?.lap_number ?? ""],
+    ["projected_next_lap_seconds", (row) => row.forecast[0]?.lapTime ?? ""],
+    ["forecast_lower_seconds", (row) => row.forecast[0]?.lower ?? ""],
+    ["forecast_upper_seconds", (row) => row.forecast[0]?.upper ?? ""],
+    ["trend_seconds_per_lap", (row) => row.trendPerLap ?? ""],
+    ["tyre_compound", (row) => row.tyreCompound || ""],
+    ["tyre_age_laps", (row) => row.tyreAge ?? ""],
+    ["rolling_backtest_mae_seconds", (row) => row.backtest.mae ?? ""],
+  ];
+  const escape = (value) => `"${String(value).replaceAll('"', '""')}"`;
+  const lines = [
+    ["grand_prix", "session", ...fields.map(([name]) => name)].map(escape).join(","),
+    ...rows.map((row) => [meetingName, sessionName, ...fields.map(([, value]) => value(row))].map(escape).join(",")),
+  ];
+  const url = URL.createObjectURL(new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `apex-pace-projection-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function TrackMap({ points, color, circuitName, circuitImage }) {
@@ -329,6 +519,49 @@ export default function App() {
   const compareDriver = drivers.find((driver) => String(driver.driver_number) === String(compareNumber));
   const driverLaps = laps.filter((lap) => String(lap.driver_number) === String(driverNumber));
   const compareLaps = laps.filter((lap) => String(lap.driver_number) === String(compareNumber));
+  const driverStats = summarizeLaps(driverLaps);
+  const compareStats = summarizeLaps(compareLaps);
+  const sessionForecasts = useMemo(
+    () => predictSessionPace(drivers, laps, stints),
+    [drivers, laps, stints],
+  );
+  const selectedForecast = sessionForecasts.find((row) => String(row.driver.driver_number) === String(driverNumber));
+  const compareForecast = sessionForecasts.find((row) => String(row.driver.driver_number) === String(compareNumber));
+  const forecastBacktest = sessionForecasts
+    .filter((row) => row.backtest.count > 0)
+    .reduce((summary, row) => ({
+      count: summary.count + row.backtest.count,
+      totalError: summary.totalError + row.backtest.mae * row.backtest.count,
+    }), { count: 0, totalError: 0 });
+  const fieldMeanAbsoluteError = forecastBacktest.count
+    ? forecastBacktest.totalError / forecastBacktest.count
+    : null;
+  const fieldSectorBests = SECTOR_KEYS.map(({ key, label }) => ({
+    key,
+    label,
+    best: laps.filter(isValidLap).map((lap) => safeNumber(lap[key]))
+      .filter((time) => time !== null && time > 0)
+      .reduce((best, time) => best === null || time < best ? time : best, null),
+  }));
+  const analysisSectors = fieldSectorBests.map((sector, index) => ({
+    label: sector.label,
+    primary: driverStats.sectors[index]?.best ?? null,
+    comparison: compareDriver ? compareStats.sectors[index]?.best ?? null : null,
+    field: sector.best,
+  }));
+  const driverPositions = positions.filter((item) => String(item.driver_number) === String(driverNumber))
+    .sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+  const startPosition = safeNumber(driverPositions[0]?.position);
+  const endPosition = safeNumber(driverPositions.at(-1)?.position);
+  const placesGained = startPosition !== null && endPosition !== null ? startPosition - endPosition : null;
+  const fastestLaps = [...driverLaps].filter(isValidLap)
+    .sort((a, b) => Number(a.lap_duration) - Number(b.lap_duration))
+    .slice(0, 8);
+  const orderedDriverLaps = [...driverLaps].filter(isValidLap)
+    .sort((a, b) => Number(a.lap_number) - Number(b.lap_number));
+  const openingPace = medianOf(orderedDriverLaps.slice(0, 5).map((lap) => Number(lap.lap_duration)));
+  const closingPace = medianOf(orderedDriverLaps.slice(-5).map((lap) => Number(lap.lap_duration)));
+  const sessionPaceDrift = openingPace !== null && closingPace !== null ? closingPace - openingPace : null;
   const fastestLap = driverLaps.filter(isValidLap)
     .reduce((best, lap) => !best || Number(lap.lap_duration) < Number(best.lap_duration) ? lap : best, null);
   const compareFastest = compareLaps.filter(isValidLap)
@@ -451,12 +684,11 @@ export default function App() {
 
         {selectedDriver && (
           <div className="driver-profile" style={{ "--team-color": teamColor(selectedDriver) }}>
-            {selectedDriver.headshot_url
-              ? <img src={selectedDriver.headshot_url} alt={driverName(selectedDriver)} />
-              : <div className="driver-initial">{String(selectedDriver.name_acronym || driverName(selectedDriver)).slice(0, 3)}</div>}
+            <DriverPortrait driver={selectedDriver} className="sidebar-portrait" />
             <div className="driver-profile-info">
-              <span>#{selectedDriver.driver_number} · {selectedDriver.team_name || "TEAM"}</span>
+              <span>DRIVER PROFILE · #{selectedDriver.driver_number}</span>
               <strong>{driverName(selectedDriver)}</strong>
+              <em>{selectedDriver.team_name || "F1 TEAM"}</em>
             </div>
           </div>
         )}
@@ -498,8 +730,22 @@ export default function App() {
             <div className="hero-streak" aria-hidden="true"><span /><span /><span /><span /><span /><span /><span /></div>
           </section>
 
+          {selectedDriver && (
+            <section className="driver-spotlight" style={{ "--team-color": teamColor(selectedDriver) }}>
+              <div className="spotlight-image"><DriverPortrait driver={selectedDriver} className="spotlight-portrait" /></div>
+              <div className="spotlight-copy">
+                <span className="eyebrow">DRIVER SPOTLIGHT · #{selectedDriver.driver_number}</span>
+                <h2>{selectedDriver.full_name || driverName(selectedDriver)}</h2>
+                <p>{selectedDriver.team_name || "Formula 1"} <span>·</span> {selectedDriver.country_code || selectedDriver.country_name || "DRIVER"}</p>
+                <div className="spotlight-tags"><span>FASTEST {formatLap(driverStats.best?.lap_duration)}</span><span>{driverStats.count} TIMED LAPS</span>{driverStats.topSpeed && <span>{driverStats.topSpeed} KM/H TOP SPEED</span>}</div>
+              </div>
+              <div className="spotlight-stat"><span>BEST LAP</span><strong>{formatLap(driverStats.best?.lap_duration)}</strong><small>{driverStats.best?.lap_number ? `LAP ${driverStats.best.lap_number}` : "NO TIME"}</small></div>
+              <div className="spotlight-number">#{selectedDriver.driver_number}</div>
+            </section>
+          )}
+
           <nav className="tabs" aria-label="Dashboard sections">
-            {["Race overview", "Telemetry lab", "Tyre strategy", "Track conditions"].map((tab, index) => (
+            {["Race overview", "Race analysis", "Pace forecast", "Telemetry lab", "Tyre strategy", "Track conditions"].map((tab, index) => (
               <button key={tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                 <span className="tab-index">0{index + 1}</span>{tab}
               </button>
@@ -567,6 +813,200 @@ export default function App() {
                         </div>
                       </div>
                     ) : <div className="empty-state">Choose a second driver from the sidebar to compare pace.</div>}
+                  </section>
+                </div>
+              )}
+
+              {activeTab === "Race analysis" && (
+                <div className="analysis-layout">
+                  <section className="analysis-intro">
+                    <div className="analysis-intro-copy">
+                      <span className="eyebrow">APEX PERFORMANCE INTELLIGENCE</span>
+                      <h2>Every lap tells<br /><em>a story.</em></h2>
+                      <p>Compare pace, repeatability and sector performance across the session.</p>
+                    </div>
+                    <div className="analysis-intro-image"><DriverPortrait driver={selectedDriver} className="analysis-portrait" /></div>
+                    <div className="analysis-intro-driver"><span>ANALYSING</span><strong>{selectedDriver?.name_acronym || "DRIVER"}</strong><i style={{ background: teamColor(selectedDriver) }} /></div>
+                  </section>
+
+                  <section className="analysis-metrics">
+                    <Metric label="BEST LAP" value={formatLap(driverStats.best?.lap_duration)} note={driverStats.best?.lap_number ? `PERSONAL BEST · LAP ${driverStats.best.lap_number}` : "NO TIMED LAP"} accent />
+                    <Metric label="MEDIAN PACE" value={formatLap(driverStats.median)} note={`${driverStats.count} VALID TIMED LAPS`} />
+                    <Metric label="TYPICAL LAP SPREAD" value={driverStats.consistency !== null ? `±${driverStats.consistency.toFixed(3)}s` : "—"} note="MEDIAN ABSOLUTE DEVIATION" />
+                    <Metric label="SESSION PACE DRIFT" value={sessionPaceDrift === null ? "—" : formatDelta(sessionPaceDrift)} note="LAST 5 MEDIAN − FIRST 5 MEDIAN" />
+                    <Metric label="POSITION CHANGE" value={placesGained === null ? "—" : `${placesGained > 0 ? "+" : ""}${placesGained}`} note={startPosition !== null && endPosition !== null ? `P${startPosition} START → P${endPosition} LATEST` : "POSITION FEED UNAVAILABLE"} />
+                  </section>
+
+                  <section className="panel analysis-pace-panel">
+                    <SectionHeading
+                      eyebrow="LAP-BY-LAP PACE"
+                      title="Session pace trace"
+                      detail="Each marker is a valid timed lap. Pit-out laps are excluded."
+                      action={<span className="analysis-tag">LOWER LAP TIME = FASTER</span>}
+                    />
+                    <PaceChart
+                      primary={driverLaps}
+                      comparison={compareLaps}
+                      primaryColor={teamColor(selectedDriver)}
+                      comparisonColor={teamColor(compareDriver)}
+                    />
+                  </section>
+
+                  <section className="panel sector-panel">
+                    <SectionHeading eyebrow="MICRO-SECTOR BREAKDOWN" title="Sector benchmarks" detail="Personal bests against the fastest sector recorded in the field" />
+                    <SectorBars sectors={analysisSectors} primaryColor={teamColor(selectedDriver)} comparisonColor={teamColor(compareDriver)} />
+                    <p className="analysis-footnote">Sector benchmarks are independent bests, not a single-lap result. A missing sector means the timing feed did not provide that split.</p>
+                  </section>
+
+                  <section className="panel analysis-detail-panel">
+                    <SectionHeading eyebrow="PACE PROFILE" title="Driver comparison" detail="Session-level view · pit-out laps excluded" />
+                    <div className="analysis-driver-head">
+                      <div><i style={{ background: teamColor(selectedDriver) }} /><span>{selectedDriver?.name_acronym || "PRIMARY"}</span></div>
+                      {compareDriver && <div><i style={{ background: teamColor(compareDriver) }} /><span>{compareDriver.name_acronym || driverName(compareDriver)}</span></div>}
+                    </div>
+                    <div className="analysis-comparison-table">
+                      {[
+                        ["BEST LAP", driverStats.best?.lap_duration, compareStats.best?.lap_duration],
+                        ["MEDIAN LAP", driverStats.median, compareStats.median],
+                        ["AVERAGE LAP", driverStats.average, compareStats.average],
+                        ["TYPICAL SPREAD (MAD)", driverStats.consistency, compareStats.consistency],
+                      ].map(([label, primary, rival]) => (
+                        <div className="analysis-comparison-row" key={label}>
+                          <span>{label}</span><strong>{primary === null || primary === undefined ? "—" : `${label.includes("CONSISTENCY") ? "±" : ""}${Number(primary).toFixed(3)}s`}</strong>
+                          {compareDriver && <strong className="rival-value">{rival === null || rival === undefined ? "—" : `${label.includes("CONSISTENCY") ? "±" : ""}${Number(rival).toFixed(3)}s`}</strong>}
+                        </div>
+                      ))}
+                    </div>
+                    <p className="analysis-footnote">Typical spread is the median absolute deviation from median lap time, a robust measure less affected by pit-stop outliers. Session pace still reflects fuel, traffic, tyre compound and track evolution.</p>
+                  </section>
+
+                  <section className="panel fastest-laps-panel">
+                    <SectionHeading eyebrow="PERSONAL BESTS" title="Fastest laps" detail={`${selectedDriver ? driverName(selectedDriver) : "Selected driver"} · top ${fastestLaps.length} valid laps`} />
+                    {fastestLaps.length ? (
+                      <div className="table-wrap">
+                        <table>
+                          <thead><tr><th>RANK</th><th>LAP</th><th>TIME</th><th>Δ TO BEST</th><th>S1</th><th>S2</th><th>S3</th><th>TRAP</th></tr></thead>
+                          <tbody>{fastestLaps.map((lap, index) => {
+                            const duration = Number(lap.lap_duration);
+                            const fastestTime = Number(driverStats.best?.lap_duration);
+                            return (
+                              <tr key={`${lap.lap_number}-${lap.date_start}`}>
+                                <td><span className={`rank-chip${index === 0 ? " rank-chip-best" : ""}`}>{String(index + 1).padStart(2, "0")}</span></td>
+                                <td className="muted-cell">{lap.lap_number}</td>
+                                <td className="time-cell">{formatLap(duration)}</td>
+                                <td className={index === 0 ? "analysis-best-delta" : "muted-cell"}>{index === 0 ? "BEST" : `+${(duration - fastestTime).toFixed(3)}s`}</td>
+                                {SECTOR_KEYS.map(({ key }) => <td className="muted-cell" key={key}>{safeNumber(lap[key])?.toFixed(3) || "—"}</td>)}
+                                <td className="muted-cell">{lap.st_speed ? `${lap.st_speed}` : "—"}</td>
+                              </tr>
+                            );
+                          })}</tbody>
+                        </table>
+                      </div>
+                    ) : <div className="empty-state">No valid lap times are available to rank.</div>}
+                  </section>
+
+                  <section className="analysis-caveat"><span>i</span><p><strong>How to read this analysis</strong> · Lap spread is the median absolute deviation from median lap time, which is less sensitive to pit-stop outliers. Pace change compares the first and last five valid laps. Both also reflect strategy and track evolution—not only driver pace.</p></section>
+                </div>
+              )}
+
+              {activeTab === "Pace forecast" && (
+                <div className="forecast-layout">
+                  <section className="forecast-hero">
+                    <div className="forecast-hero-copy">
+                      <span className="eyebrow">APEX PACE MODEL · SESSION DATA</span>
+                      <h2>Read the pace.<br /><em>Not the headlines.</em></h2>
+                      <p>An explainable short-horizon forecast, fitted to recent clean laps from the latest tyre stint.</p>
+                    </div>
+                    <div className="forecast-hero-icon" aria-hidden="true"><span>↗</span><i /><i /><i /></div>
+                    <div className="forecast-hero-chip"><i /> LAP-TIME PROJECTION</div>
+                  </section>
+
+                  <section className="forecast-summary">
+                    <Metric
+                      label="NEXT LAP PROJECTION"
+                      value={formatLap(selectedForecast?.forecast[0]?.lapTime)}
+                      note={selectedForecast?.forecast[0] ? `LAP ${selectedForecast.forecast[0].lapNumber} · ${selectedForecast.sampleSize} CLEAN LAPS` : "NEED 5 CLEAN LAPS IN STINT"}
+                      accent
+                    />
+                    <Metric
+                      label="MODEL UNCERTAINTY"
+                      value={selectedForecast?.uncertainty !== null && selectedForecast?.uncertainty !== undefined ? `±${selectedForecast.uncertainty.toFixed(2)}s` : "—"}
+                      note={selectedForecast?.status ? `${selectedForecast.sampleSize} FITTED LAPS · ROBUST RESIDUAL BAND` : "INSUFFICIENT HISTORY"}
+                    />
+                    <Metric
+                      label="ROLLING BACKTEST MAE"
+                      value={selectedForecast?.backtest.mae !== null && selectedForecast?.backtest.mae !== undefined ? `±${selectedForecast.backtest.mae.toFixed(2)}s` : "—"}
+                      note={selectedForecast?.backtest.count ? `${selectedForecast.backtest.count} HISTORICAL ONE-LAP TESTS` : "NEED MORE CLEAN LAPS"}
+                    />
+                    <Metric
+                      label="PACE TREND"
+                      value={selectedForecast?.trendPerLap !== null && selectedForecast?.trendPerLap !== undefined ? `${selectedForecast.trendPerLap > 0 ? "+" : ""}${selectedForecast.trendPerLap.toFixed(3)}s` : "—"}
+                      note={selectedForecast?.trendPerLap === null || selectedForecast?.trendPerLap === undefined ? "NO FIT AVAILABLE" : selectedForecast.trendPerLap < 0 ? "TRENDING FASTER / LAP" : selectedForecast.trendPerLap > 0 ? "TRENDING SLOWER / LAP" : "PACE TREND FLAT"}
+                    />
+                  </section>
+
+                  <section className="panel forecast-chart-panel">
+                    <SectionHeading
+                      eyebrow="NEXT THREE LAPS"
+                      title="Projected pace window"
+                      detail="Recent stint trend with a robust uncertainty band · not a race result prediction"
+                      action={sessionForecasts.some((row) => row.forecast.length) ? (
+                        <button
+                          className="export-button"
+                          onClick={() => downloadForecastCsv(sessionForecasts, selectedMeeting?.meeting_name || "Grand Prix", sessions.find((item) => String(item.session_key) === String(sessionKey))?.session_name || "Session")}
+                        >↓ EXPORT CSV</button>
+                      ) : null}
+                    />
+                    <div className="forecast-legend">
+                      <span><i style={{ background: teamColor(selectedDriver) }} />{selectedDriver?.name_acronym || "PRIMARY DRIVER"}</span>
+                      {compareForecast?.forecast.length > 0 && <span><i style={{ background: teamColor(compareDriver) }} />{compareDriver?.name_acronym || "COMPARISON"}</span>}
+                      <span className="forecast-band-key"><i /> UNCERTAINTY BAND</span>
+                    </div>
+                    <ForecastChart
+                      forecasts={[selectedForecast, compareForecast].filter(Boolean)}
+                      colors={[teamColor(selectedDriver), teamColor(compareDriver)]}
+                    />
+                  </section>
+
+                  <section className="panel forecast-driver-panel">
+                    <SectionHeading eyebrow="FIELD PROJECTION" title="Predicted next-lap pace" detail="Ranked by modelled lap time · not by predicted finishing position" />
+                    <div className="table-wrap">
+                      <table className="forecast-table">
+                        <thead><tr><th>RANK</th><th>DRIVER</th><th>PROJECTED</th><th>UNCERTAINTY</th><th>TREND / LAP</th><th>TYRE</th><th>DATA</th></tr></thead>
+                        <tbody>
+                          {sessionForecasts.slice(0, 18).map((row, index) => (
+                            <tr
+                              key={row.driver.driver_number}
+                              className={String(row.driver.driver_number) === String(driverNumber) ? "selected-row" : ""}
+                              onClick={() => setDriverNumber(String(row.driver.driver_number))}
+                            >
+                              <td><span className={`rank-chip${index === 0 && row.forecast.length ? " rank-chip-best" : ""}`}>{String(index + 1).padStart(2, "0")}</span></td>
+                              <td><span className="driver-cell"><i style={{ background: teamColor(row.driver) }} />{row.driver.name_acronym || driverName(row.driver)}</span></td>
+                              <td className="time-cell">{formatLap(row.forecast[0]?.lapTime)}</td>
+                              <td className="muted-cell">{row.uncertainty !== null ? `±${row.uncertainty.toFixed(2)}s` : "—"}</td>
+                              <td className="muted-cell">{row.trendPerLap === null ? "—" : `${row.trendPerLap > 0 ? "+" : ""}${row.trendPerLap.toFixed(3)}s`}</td>
+                              <td>{row.tyreCompound ? <span className="tyre-tag"><i style={{ borderColor: TYRE_COLORS[row.tyreCompound] || "#8b94a5" }} />{row.tyreCompound.slice(0, 1)}</span> : "—"}</td>
+                              <td><span className={`confidence-pill confidence-${row.status.toLowerCase()}`}>{row.status === "INSUFFICIENT" ? "LOW DATA" : `${row.sampleSize} LAPS`}</span></td>
+                            </tr>
+                          ))}
+                          {!sessionForecasts.length && <tr><td colSpan="7" className="table-empty">Driver and lap data have not loaded yet.</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+
+                  <section className="panel model-validation">
+                    <div className="validation-top">
+                      <span className="validation-symbol">✓</span>
+                      <div><span className="eyebrow">MODEL SANITY CHECK</span><h3>Rolling one-lap backtest</h3></div>
+                    </div>
+                    <div className="validation-score"><strong>{fieldMeanAbsoluteError === null ? "—" : `${fieldMeanAbsoluteError.toFixed(2)}s`}</strong><span>FIELD-WIDE MAE</span></div>
+                    <p>Each historical test predicts one lap from up to eight earlier clean laps; it never trains on that lap. {forecastBacktest.count ? `${forecastBacktest.count} held-out lap predictions across the field.` : "More valid lap history is required to score the model."}</p>
+                  </section>
+
+                  <section className="forecast-method">
+                    <span className="method-icon">i</span>
+                    <div><strong>What this model does—and does not do</strong><p>Fits a bounded linear trend to the last eight valid laps from the driver’s latest tyre stint. The shaded range is based on robust median absolute residuals, with a minimum ±0.15s band. “Robust” means eight laps were available; it is not calibrated probability or guaranteed model accuracy. This is a pace-only heuristic, not a trained machine-learning model, pit-wall strategy, or forecast of race winners. It does not model traffic, fuel, weather changes, incidents, tyre degradation, or future pit stops; treat it as directional context rather than certainty.</p></div>
                   </section>
                 </div>
               )}

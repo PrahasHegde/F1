@@ -1,4 +1,4 @@
-const BASE_URL = "https://api.openf1.org/v1";
+const BASE_URL = `${import.meta.env.VITE_OPENF1_BASE_URL || "/openf1"}/v1`;
 const cache = new Map();
 const MIN_REQUEST_INTERVAL_MS = 450;
 let requestQueue = Promise.resolve();
@@ -32,7 +32,10 @@ export async function fetchOpenF1(endpoint, params = {}) {
       response = await scheduleRequest(url);
     }
     if (!response.ok) {
-      const error = new Error(`OpenF1 returned ${response.status} for ${endpoint}.`);
+      const message = response.status === 401
+        ? `OpenF1 requires a subscription for real-time data (401 on ${endpoint}). Historical data from 2023 onward is normally public; try another season or retry after the live session.`
+        : `OpenF1 returned ${response.status} for ${endpoint}.`;
+      const error = new Error(message);
       error.status = response.status;
       throw error;
     }
